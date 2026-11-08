@@ -1,3 +1,5 @@
+<img width="1080" height="2097" alt="104241" src="https://github.com/user-attachments/assets/d1fa0d93-2c3b-47a1-a1bc-79d5bbb1c362" />
+<img width="1080" height="2038" alt="104239" src="https://github.com/user-attachments/assets/ffd5a540-fe32-45a3-a1e8-6e5efd6989c0" />
 # BoostZ
 
 Booster de volume et de basses + égaliseur global pour Android (Kotlin + Jetpack Compose), thème noir et vert néon.
