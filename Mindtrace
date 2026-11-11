@@ -1,0 +1,497 @@
+# MINDTRACE — SPÉCIFICATION D'EXÉCUTION ANDROID POUR OPENCODE
+
+## 0. CONTRAT D'EXÉCUTION
+
+Tu es ingénieur senior Android / React Native / Kotlin / TypeScript / cryptographie appliquée. Tu produis une application Android réelle, compilable, testée.
+
+Règles non négociables :
+
+- Tu écris les fichiers toi-même. Aucun livrable sous forme d'extraits commentés.
+- Tu installes, tu compiles, tu lances, tu lis les erreurs, tu corriges. Boucle jusqu'à build vert.
+- Aucune donnée factice pour masquer un service non implémenté. Si un service n'est pas fini, il échoue explicitement (`throw new NotImplementedError`) et l'UI l'affiche.
+- Aucune affirmation de succès sans preuve : build log, sortie de test, hash de fichier.
+- Si une action exige une intervention humaine (clé API, certificat, compte Google), tu t'arrêtes, tu documentes précisément l'action, tu fournis une valeur de substitution documentée et tu continues le reste.
+- Langue du code : identifiants en anglais, commentaires en français. UI et README intégralement en français.
+
+Toute ambiguïté restante est tranchée par toi, et la décision est consignée dans `docs/DECISIONS.md`.
+
+---
+
+## 1. STACK — VERSIONS VERROUILLÉES
+
+- Node 20 LTS, npm 10.
+- Expo SDK 52 stable, React Native 0.76, TypeScript 5.6 strict.
+- Expo Router 4 (routes typées).
+- `expo-sqlite`, `expo-secure-store`, `expo-local-authentication`, `expo-notifications`, `expo-file-system`, `expo-print`, `expo-sharing`, `expo-document-picker`, `expo-clipboard`.
+- `react-native-reanimated` 3.16, `react-native-svg`, `victory-native` ou `react-native-gifted-charts` pour les graphiques.
+- `argon2-browser` ou binding natif Kotlin pour Argon2id.
+- Kotlin pour `modules/secure-crypto` (Keystore, AES-GCM natif, FLAG_SECURE, Argon2id si le binding JS est insuffisant).
+- API Google Gemini v1beta, modèles `gemini-2.5-flash` et `gemini-2.5-pro` uniquement.
+- EAS Build.
+
+Aucune dépendance en `latest`. Toutes les versions sont figées dans `package.json` et `package-lock.json` est commité.
+
+Cibles : `minSdkVersion 26`, `targetSdkVersion 35`, `compileSdkVersion 35`. ABIs : `arm64-v8a`, `armeabi-v7a`.
+
+---
+
+## 2. ARCHITECTURE
+
+Architecture locale-first, sans backend.
+
+- `app/` : routes Expo Router.
+- `services/` : logique métier pure, testable hors UI.
+- `modules/secure-crypto/` : module natif Kotlin, source unique de vérité cryptographique.
+- `db/` : migrations versionnées, requêtes préparées.
+- `prompts/` : templates Gemini versionnés en fichiers `.ts`, jamais en dur dans les services.
+- `types/` : types partagés, aucune utilisation de `any`.
+
+Règle d'isolation : aucun composant UI n'accède directement à SQLite, à SecureStore ou au réseau. Tout passe par un service.
+
+Le journal est 100 % fonctionnel hors ligne. Les fonctions Gemini échouent proprement hors réseau avec un état UI dédié et une file de réessai manuelle.
+
+---
+
+## 3. IDENTITÉ VISUELLE
+
+Palette imposée :
+
+| Rôle | Hex |
+|---|---|
+| Fond | `#09090D` |
+| Surface carte | `#15151D` |
+| Surface élevée | `#1E1E29` |
+| Bordure | `#2A2A38` |
+| Accent | `#7655C9` |
+| Accent clair | `#B7A0FF` |
+| Texte principal | `#F2F0F7` |
+| Texte secondaire | `#9C99AD` |
+| Succès | `#4FB286` |
+| Alerte | `#D9614C` |
+
+Contraintes : rayons 16–24 px, dégradés linéaires accent→transparent en opacité ≤ 0.18, glassmorphism limité aux barres et modales (blur 20, overlay `#09090D` à 72 %), ombres portées discrètes, aucune bordure blanche.
+
+Typographie : Inter, échelle 12/14/16/20/26/34, graisses 400/500/600. Interlignage 1.45 minimum.
+
+Animations : Reanimated uniquement, durées 180–280 ms, easing `ease-out`. Respect de `AccessibilityInfo.isReduceMotionEnabled`.
+
+Navigation basse à 5 onglets (Accueil, Journal, Analyses, Assistant, Paramètres) + FAB de création d'entrée ancré au-dessus de la barre. Support du clavier virtuel via `KeyboardAvoidingView` et `KeyboardAwareScrollView`. Adaptation aux largeurs 320–600 dp et aux encarts d'affichage. Safe areas respectées.
+
+Toutes les chaînes UI passent par `constants/i18n.fr.ts`. Aucun texte en dur dans les composants.
+
+Accessibilité : `accessibilityLabel` sur tous les éléments interactifs, cibles tactiles ≥ 48 dp, contrastes ≥ 4.5:1, support du scaling système jusqu'à 200 %.
+
+---
+
+## 4. MODÈLE DE MENACES
+
+Actif protégé : le contenu du journal, les synthèses, les conversations.
+
+Adversaires couverts : accès physique au déverrouillé, extraction de la base SQLite, sauvegarde ADB, lecture des logs, APK décompilé, sauvegarde cloud non chiffrée.
+
+Hors périmètre : appareil rooté avec mémoire vivante instrumentée, keylogger système, evil maid sur le firmware.
+
+Conséquences imposées :
+
+- Aucun texte clair en base, dans les logs, dans les noms de fichiers, dans les notifications.
+- `FLAG_SECURE` actif sur toutes les routes authentifiées (Kotlin, appliqué au niveau de l'Activity).
+- Presse-papier purgé après 60 s sur copie de contenu sensible.
+- Journalisation conditionnée à `__DEV__`, avec redaction systématique.
+
+---
+
+## 5. CRYPTOGRAPHIE — SPÉCIFICATION EXACTE
+
+### 5.1 Enveloppe
+
+1. Mot de passe maître → Argon2id (m = 64 MiB, t = 3, p = 4, sel 32 octets aléatoire) → KEK 256 bits.
+2. KEK chiffre une DEK 256 bits aléatoire (AES-256-GCM) → DEK enveloppée persistée dans SecureStore.
+3. La DEK chiffre toutes les données applicatives.
+4. La KEK n'est jamais persistée. Elle vit en mémoire uniquement pendant la session.
+5. Verrouillage = purge de la KEK et de la DEK en mémoire.
+
+Si Argon2id n'est pas disponible sur la cible, repli sur PBKDF2-HMAC-SHA256, 600 000 itérations, sel 32 octets, et le paramètre est stocké dans le blob de tête pour permettre la migration.
+
+### 5.2 Format de chiffrement versionné
+
+`v1.<keyId>.<nonce_b64url>.<ciphertext_b64url>`
+
+- Nonce : 12 octets depuis `Crypto.getRandomBytes`, jamais réutilisé.
+- `keyId` : identifiant court de la DEK, incrémenté à chaque rotation.
+- AAD = `v1.<keyId>.<entityType>`.
+- Rotation de DEK : nouvelle DEK enveloppée par la KEK, réchiffrement paresseux des lignes au fil des lectures, `keyId` antérieurs conservés jusqu'à complétion.
+- Rotation de mot de passe : ré-enveloppe la DEK, ne touche pas aux données.
+
+### 5.3 Keystore
+
+- Génération d'une paire de clés AES dans Android Keystore, `setUserAuthenticationRequired(true)` avec `setUserAuthenticationParameters(0, AUTH_BIOMETRIC_STRONG)`.
+- La clé Keystore scelle la DEK enveloppée pour le déverrouillage biométrique.
+- Échec biométrique → repli mot de passe, jamais de contournement.
+
+### 5.4 Récupération
+
+- Génération d'une phrase de récupération de 24 mots (BIP-39) dérivant une clé de récupération indépendante.
+- Celle-ci enveloppe une copie de la DEK, stockée chiffrée localement et exportable en fichier `.mtrk`.
+- Écran d'onboarding dédié : affichage, vérification par re-saisie partielle de 3 mots, confirmation de sauvegarde obligatoire.
+- Avertissement explicite : perte du mot de passe ET de la phrase = perte définitive des données.
+
+---
+
+## 6. SCHÉMA SQLITE
+
+Toutes les colonnes texte métier sont des blobs chiffrés `TEXT`. Les métadonnées en clair sont limitées à ce qui est listé.
+
+```sql
+schema_version(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+
+entries(
+  id TEXT PRIMARY KEY,            -- uuid v4, clair
+  created_at INTEGER NOT NULL,    -- epoch ms, clair
+  updated_at INTEGER NOT NULL,    -- epoch ms, clair
+  entry_date TEXT NOT NULL,       -- YYYY-MM-DD, clair (index/calendrier)
+  title_enc TEXT,                 -- null si absent
+  body_enc TEXT NOT NULL,
+  mood_intensity INTEGER,         -- 1..10, clair
+  is_favorite INTEGER NOT NULL DEFAULT 0,
+  is_important INTEGER NOT NULL DEFAULT 0,
+  week_bucket TEXT NOT NULL,      -- YYYY-Www, clair
+  synth_id TEXT REFERENCES syntheses(id)
+);
+CREATE INDEX idx_entries_date ON entries(entry_date DESC);
+CREATE INDEX idx_entries_bucket ON entries(week_bucket, synth_id);
+
+emotions(id TEXT PRIMARY KEY, label_enc TEXT NOT NULL, color TEXT NOT NULL, is_custom INTEGER NOT NULL DEFAULT 0, sort_order INTEGER NOT NULL);
+entry_emotions(entry_id TEXT NOT NULL REFERENCES entries(id) ON DELETE CASCADE, emotion_id TEXT NOT NULL REFERENCES emotions(id), PRIMARY KEY(entry_id, emotion_id));
+
+tags(id TEXT PRIMARY KEY, label_enc TEXT NOT NULL UNIQUE);
+entry_tags(entry_id TEXT NOT NULL REFERENCES entries(id) ON DELETE CASCADE, tag_id TEXT NOT NULL REFERENCES tags(id), PRIMARY KEY(entry_id, tag_id));
+
+syntheses(
+  id TEXT PRIMARY KEY,
+  period_start TEXT NOT NULL,
+  period_end TEXT NOT NULL,
+  kind TEXT NOT NULL,             -- 'weekly' | 'monthly'
+  payload_enc TEXT NOT NULL,      -- JSON structuré
+  schema_version INTEGER NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  prompt_version TEXT NOT NULL,
+  model TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+conversations(id TEXT PRIMARY KEY, title_enc TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+messages(id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, role TEXT NOT NULL, content_enc TEXT NOT NULL, context_mode INTEGER NOT NULL, created_at INTEGER NOT NULL);
+
+api_calls(
+  id TEXT PRIMARY KEY,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL,
+  period_start TEXT, period_end TEXT,
+  entry_ids_hash TEXT,
+  tokens_in INTEGER, tokens_out INTEGER,
+  status TEXT NOT NULL,           -- 'pending' | 'success' | 'error' | 'cancelled'
+  http_status INTEGER, error_code TEXT,
+  started_at INTEGER NOT NULL, finished_at INTEGER,
+  prompt_version TEXT NOT NULL, model TEXT NOT NULL
+);
+
+advice(id TEXT PRIMARY KEY, body_enc TEXT NOT NULL, source_synth_id TEXT, is_favorite INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+
+settings(key TEXT PRIMARY KEY, value_enc TEXT NOT NULL);
+```
+
+Contraintes : `PRAGMA foreign_keys = ON`, `journal_mode = WAL`, migrations idempotentes, downgrade interdit.
+
+---
+
+## 7. AUTHENTIFICATION
+
+Premier lancement → onboarding séquentiel : mot de passe (≥ 12 caractères, indicateur de robustesse, confirmation), génération de la DEK, phrase de récupération, biométrie optionnelle, délai de verrouillage (30 s / 1 min / 5 min / 15 min / jamais).
+
+Session : verrouillage manuel, verrouillage auto sur inactivité mesurée par `AppState` + horloge monotone, verrouillage sur `background` si délai dépassé, verrouillage sur échec biométrique répété.
+
+Écran de verrouillage : déverrouillage biométrique en priorité, repli mot de passe, lien « phrase de récupération ». Aucun compteur de tentatives bloquant, mais délai progressif après 5 échecs.
+
+Changement de mot de passe : vérification de l'ancien, ré-enveloppe la DEK, invalide le cache biométrique, exige une nouvelle confirmation de la phrase de récupération.
+
+---
+
+## 8. JOURNAL
+
+CRUD complet, autosave à 800 ms d'inactivité avec debounce + sauvegarde sur blur/navigation, indicateur d'état (`enregistré` / `en cours` / `erreur`), restauration du brouillon après crash.
+
+Éditeur : plein écran, barre d'outils minimale, compteur de caractères, insertion de date/heure, sélection d'émotions, curseur d'intensité 1–10, tags libres avec autocomplétion, marqueur « événement important », favori.
+
+Liste : groupée par jour, aperçu tronqué à 2 lignes, badges d'émotions, filtre par période / émotion / tag / favori, recherche plein texte sur contenu déchiffré (index en mémoire, jamais d'index clair persistant).
+
+Calendrier : vue mensuelle, intensité moyenne par jour en heatmap, tap sur un jour → entrées du jour.
+
+Émotions par défaut : Joie, Tristesse, Anxiété, Colère, Stress, Solitude, Vide émotionnel, Fatigue, Irritabilité, Motivation, Sérénité, Peur, Frustration, Honte, Culpabilité. Toutes personnalisables, création et suppression libres.
+
+Suppression : confirmation, corbeille logique 30 jours, purge définitive ensuite.
+
+---
+
+## 9. GEMINI — CONFIGURATION
+
+Écran `Paramètres > Intelligence artificielle > Google Gemini` :
+
+- Champ clé API masqué, bascule afficher/masquer, test de connexion, choix du modèle parmi la liste blanche, activation/désactivation globale, réglage du niveau de détail d'analyse, suppression de la clé, indicateur d'état de connexion horodaté.
+
+Clé stockée via Keystore, jamais en clair, jamais dans les exports non chiffrés, jamais dans les logs, jamais dans Git. `.gitignore` couvre `.env*`.
+
+Couche réseau : timeout 60 s, annulation via `AbortController`, 3 réessais exponentiels (1 s, 2 s, 4 s + jitter) sur 429/500/503 uniquement, respect de `Retry-After`, lecture des quotas et affichage du temps d'attente.
+
+Validation des réponses : parse JSON, validation par schéma Zod, réparation unique via un second appel court en cas de JSON invalide, échec propre sinon.
+
+Aucun appel sans consentement : chaque action réseau passe par une modale de confirmation listant le volume et la nature des données transmises, mémorisable par type d'analyse.
+
+---
+
+## 10. MOTEUR D'ANALYSE DSM-5-TR
+
+Le moteur ne produit jamais de diagnostic. Vocabulaire imposé : « piste à explorer », « caractéristiques éventuellement compatibles », « informations insuffisantes », « éléments à approfondir avec un professionnel ». Aucun pourcentage. Aucune probabilité chiffrée.
+
+Catégories explorées : troubles dépressifs, anxieux, bipolaires, obsessionnels compulsifs, liés aux traumatismes et au stress, de la personnalité, TDAH, du sommeil, alimentaires, et toute autre catégorie justifiée par les données.
+
+Axes examinés : variations d'humeur, tristesse persistante, anxiété, ruminations, peurs, estime de soi, relations sociales, concentration, sommeil, énergie, impulsivité, irritabilité, pensées répétitives, retentissement fonctionnel.
+
+Chaque piste produite contient obligatoirement les 13 champs : catégorie, observations, raisons de l'évocation, critères DSM-5-TR éventuellement compatibles, durée rapportée, fréquence, intensité, retentissement, informations manquantes, éléments contradictoires, questions complémentaires, conseils, pertinence d'une consultation.
+
+Le moteur doit pouvoir conclure explicitement à l'absence d'hypothèse dégagée.
+
+Séparation stricte dans la sortie entre : verbatim utilisateur, observation, inférence, inconnu. Une entrée isolée ne suffit jamais à ouvrir une piste.
+
+---
+
+## 11. ANALYSE HEBDOMADAIRE
+
+Cadence : 7 jours glissants par rapport à la dernière synthèse réussie.
+
+Déclenchement : automatique si l'option est active, sinon proposition. Fonctionne sans tâche de fond : au démarrage, si une échéance est dépassée, l'app affiche une bannière « analyse en attente » avec action immédiate. Une tâche `expo-notifications` + `expo-task-manager` est en plus enregistrée en best-effort, jamais considérée comme fiable.
+
+Sélection : uniquement les entrées `synth_id IS NULL` et `entry_date` dans la fenêtre. Une entrée déjà rattachée à une synthèse n'est jamais renvoyée.
+
+Étapes :
+
+1. Verrou acquisition + calcul de la clé d'idempotence `sha256(period_start|period_end|sorted(entry_ids)|prompt_version)`.
+2. Si la clé existe avec statut `success` → réutiliser, ne pas appeler.
+3. Si `pending` → reprendre. Si `error` → relancer sous la même clé.
+4. Appel Gemini, `responseMimeType: application/json`, `responseSchema` fourni, `temperature: 0.3`, `maxOutputTokens: 4096`.
+5. Validation Zod du JSON retourné.
+6. Persistance chiffrée de la synthèse + rattachement transactionnel des entrées (`UPDATE entries SET synth_id = ?`).
+7. Libération du verrou.
+
+Structure JSON imposée :
+
+```json
+{
+  "period": { "start": "YYYY-MM-DD", "end": "YYYY-MM-DD" },
+  "emotional_summary": "string",
+  "dominant_emotions": [],
+  "notable_events": [],
+  "recurring_themes": [],
+  "repetitive_thoughts": [],
+  "reported_difficulties": [],
+  "mood_evolution": "string",
+  "sleep_observations": [],
+  "energy_observations": [],
+  "social_observations": [],
+  "functional_impact": [],
+  "protective_factors": [],
+  "missing_information": [],
+  "clinical_hypotheses_to_explore": [
+    { "category": "string", "observations": [], "rationale": [], "dsm_criteria_maybe_compatible": [], "duration_reported": "string", "frequency": "string", "intensity": "string", "functional_impact": "string", "missing_information": [], "contradictions": [], "followup_questions": [], "advice": [], "professional_consult_relevance": "string" }
+  ],
+  "advice": [],
+  "uncertainties": []
+}
+```
+
+Le JSON doit rester concis : chaque tableau ≤ 6 éléments, chaque chaîne ≤ 200 caractères, sauf `emotional_summary` (≤ 900).
+
+---
+
+## 12. COMPARAISON LONGITUDINALE
+
+À chaque nouvelle semaine : charger la synthèse précédente + les nouvelles entrées, puis produire un diff structuré (apparitions, persistance, améliorations, résolutions, régressions, informations toujours manquantes).
+
+Règles :
+
+- Absence de mention ≠ disparition du symptôme : tout élément non réobservé est marqué `unmentioned`, pas `resolved`.
+- Une hypothèse devient `dropped` uniquement sur contradiction explicite ou sur 3 fenêtres consécutives sans mention.
+- Une répétition dans le journal n'est jamais présentée comme preuve clinique.
+
+---
+
+## 13. BILANS MENSUELS
+
+Tous les 30 jours, agrégation des synthèses hebdomadaires de la période, sans renvoyer le journal brut.
+
+Contenu : évolution de l'humeur, émotions dominantes, difficultés persistantes, améliorations, événements récurrents, évolution des habitudes, tendances comportementales, pistes à approfondir, informations manquantes, conseils.
+
+Historique conservé, comparaison deux à deux possible entre bilans.
+
+Mêmes garanties d'idempotence que la section 11.
+
+---
+
+## 14. ASSISTANT GEMINI
+
+Fonction prioritaire. Bouton proéminent sur l'Accueil et le Journal.
+
+Interface : liste de conversations, création, suppression, suppression globale, saisie libre, envoi, bulles, indicateur de génération, annulation, suggestions de questions, sélecteur de contexte.
+
+Trois niveaux de contexte, sélection explicite, mémorisés par conversation :
+
+1. Synthèses seules (défaut).
+2. Synthèses + 5 dernières entrées.
+3. Entrées choisies manuellement via un sélecteur à cases.
+
+Confirmation obligatoire avant chaque envoi : liste du nombre de synthèses et d'entrées, dates concernées, volume estimé en tokens.
+
+Historique : chiffré, tronqué à 12 messages les plus récents + résumé de contexte, jamais l'historique intégral.
+
+Qualité imposée au modèle via prompt système : français, empathie, nuance, citation des dates, séparation faits/interprétations, aveu des manques, zéro invention, zéro diagnostic ferme.
+
+Les 13 questions d'exemple de la spécification initiale sont câblées comme suggestions cliquables.
+
+---
+
+## 15. CONSEILS
+
+Rubrique « Mes conseils » alimentée par les sorties d'analyse. Catégories : respiration, relaxation, gestion du stress, exercices TCC, introspection, sommeil, gratitude, déclencheurs émotionnels, bien-être, consultation professionnelle.
+
+Chaque conseil est daté, sourcé, non culpabilisant, actionnable en moins de 10 minutes. Mise en favori et suppression disponibles.
+
+---
+
+## 16. TABLEAU DE BORD
+
+Bannière de bienvenue contextuelle (heure), humeur du jour, dernière entrée, total d'entrées, heatmap du calendrier émotionnel, courbe 30 jours, carte de synthèse hebdomadaire, dernières observations, conseil du jour, date de la prochaine analyse, trois actions principales (nouvelle entrée, analyser, poser une question).
+
+Toutes les valeurs proviennent de requêtes réelles. Aucun état vide silencieux : chaque bloc vide affiche une invite d'amorçage.
+
+---
+
+## 17. GRAPHIQUES
+
+Courbes d'humeur, stress, anxiété exprimée ; histogramme de fréquence des émotions ; intensité moyenne ; thèmes récurrents ; vues hebdomadaires et mensuelles. Filtres 7 j / 30 j / 3 m / 6 m / 1 an / tout.
+
+Chaque graphique expose sa source et son échantillon (`n = …`). Fréquence lexicale et gravité clinique ne sont jamais confondues dans les libellés.
+
+---
+
+## 18. DÉTECTION DE DÉTRESSE
+
+Analyse locale par mots-clés pondérés sur le texte déchiffré (lexique fourni en constante, FR), sans appel API.
+
+Déclencheurs : mention d'idées suicidaires, « ne plus être là », « à quoi bon », vocabulaire d'épuisement extrême combiné à une intensité ≤ 3.
+
+Réaction : carte d'alerte immédiate, non bloquante, avec ressources France — 3114 (prévention du suicide), 15 (SAMU), 112 (urgences européennes) — liens `tel:`, invitation à prévenir un proche.
+
+Formulation imposée : l'app ne surveille pas en continu, ne mesure pas fiablement le risque suicidaire.
+
+---
+
+## 19. NOTIFICATIONS
+
+Rappel quotidien (heure choisie), rappel hebdomadaire d'analyse, avis de bilan disponible, rappel personnalisé. Aucun contenu intime dans le payload : uniquement « Votre journal vous attend », « Une analyse est prête ».
+
+Tout est désactivable individuellement. Demande de permission différée après la première entrée.
+
+---
+
+## 20. EXPORT / RESTAURATION / PURGE
+
+- Export chiffré `.mtrk` (même enveloppe, en-tête de version, phrase de récupération requise pour l'import).
+- Import avec validation d'intégrité, détection de collision d'ID, fusion ou remplacement au choix.
+- Export PDF des bilans via `expo-print`, protégé par mot de passe quand la plateforme le permet, sinon mention explicite de l'absence de protection dans le PDF lui-même.
+- Purge totale : confirmation par saisie du mot de passe, suppression base + SecureStore + fichiers + notifications planifiées.
+- Les clés ne sont jamais incluses dans un export non chiffré.
+
+---
+
+## 21. TESTS
+
+Jest + `@testing-library/react-native`. Base SQLite en mémoire, module crypto mocké en surface puis testé réellement sur les vecteurs.
+
+Matrice obligatoire, chaque cas avec assertion concrète :
+
+| # | Cas | Assertion |
+|---|---|---|
+| 1 | Création d'entrée | ligne présente, `body_enc ≠ body` |
+| 2 | Aucun clair en base | dump de la table `entries`, grep du texte saisi → 0 occurrence |
+| 3 | Modification | `updated_at` croît, contenu déchiffré à jour |
+| 4 | Suppression | cascade sur `entry_emotions` et `entry_tags` |
+| 5 | Chiffrement/déchiffrement aller-retour | égalité stricte, nonce différent à chaque appel |
+| 6 | Altération du ciphertext | `decrypt` lève une erreur GCM |
+| 7 | Mauvaise KEK | échec propre, pas de corruption |
+| 8 | Rotation de DEK | anciennes lignes lisibles, `keyId` incrémenté |
+| 9 | Verrouillage inactivité | KEK absente de la mémoire après délai |
+| 10 | Échec biométrique | repli mot de passe proposé |
+| 11 | Clé API absente | appel bloqué avec message dédié |
+| 12 | 429 | réessai exponentiel, `Retry-After` respecté |
+| 13 | JSON invalide | réparation tentée une fois puis échec propre |
+| 14 | Synthèse hebdo nominale | entrées rattachées, `synth_id` non nul |
+| 15 | Anciennes entrées | 2e semaine → payload ne contient que les nouvelles |
+| 16 | Double déclenchement | un seul `api_call`, une seule synthèse |
+| 17 | Reprise après `error` | même clé d'idempotence réutilisée |
+| 18 | Comparaison longitudinale | élément non mentionné marqué `unmentioned` |
+| 19 | Sélection de contexte niveau 3 | seules les entrées cochées dans le payload |
+| 20 | Chat : troncature | > 12 messages → seuls les 12 derniers + résumé |
+| 21 | Hors ligne | écriture OK, appel Gemini en erreur explicite |
+| 22 | Purge totale | base vide, SecureStore vidé, fichiers absents |
+| 23 | Migration | schéma à jour, données conservées |
+| 24 | Mots-clés détresse | carte d'alerte rendue avec les 3 numéros |
+
+Commandes de vérification à exécuter et coller en sortie :
+
+```
+npx tsc --noEmit
+npm test -- --coverage
+grep -r "console.log" services/ db/ modules/ --include=*.ts --include=*.kt
+sqlite3 dump | grep -i "<texte d'une entrée de test>"
+```
+
+---
+
+## 22. EAS
+
+`eas.json` avec trois profils :
+
+- `development` : `developmentClient: true`, distribution interne.
+- `preview` : `buildType: "apk"`, distribution interne.
+- `production` : `buildType: "app-bundle"`, `autoIncrement: true`.
+
+```json
+{
+  "cli": { "version": ">= 12.0.0", "appVersionSource": "remote" },
+  "build": {
+    "development": { "developmentClient": true, "distribution": "internal", "android": { "buildType": "apk" } },
+    "preview": { "distribution": "internal", "android": { "buildType": "apk" } },
+    "production": { "autoIncrement": true, "android": { "buildType": "app-bundle" } }
+  },
+  "submit": { "production": {} }
+}
+```
+
+`app.json` : `package: "ai.mindtrace.app"`, `versionCode` géré par EAS, permissions Android limitées au strict nécessaire (`USE_BIOMETRIC`, `POST_NOTIFICATIONS`, `INTERNET`), `allowBackup: false`.
+
+---
+
+## 23. ORDRE DE TRAVAIL
+
+1. Environnement, versions, projet Expo vide qui démarre.
+2. Design system, thème, composants primitifs, navigation.
+3. Module crypto Kotlin + couche TS + tests 5–8.
+4. Base SQLite, migrations, services de persistance + tests 1–4, 23.
+5. Onboarding, auth, verrouillage + tests 9–10.
+6. Journal complet.
+7. Graphiques, tableau de bord.
+8. Configuration Gemini + couche réseau + tests 11–13, 21.
+9. Prompts, moteur DSM, synthèse hebdo + tests 14–17.
+10. Comparaison longitudinale, bilans mensuels + test 18.
+11. Chat, sélecteur de contexte + tests 19–20.
+12. Conseils, détresse, notifications.
+13. Export,
