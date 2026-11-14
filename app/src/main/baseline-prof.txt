@@ -1,0 +1,3 @@
+# Profil de démarrage : compile à l'avance le code de l'application et de l'interface.
+HSPLapp/boostz/**;->**(**)**
+Lapp/boostz/**;
